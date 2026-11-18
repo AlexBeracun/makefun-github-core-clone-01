@@ -22,7 +22,7 @@ import {
   type Pull,
   type Repo,
 } from './store.ts';
-import { computeMergeable, jsonError, requireAuth, squashMergeTree } from './rest.ts';
+import { computeMergeable, invalidateIssue, jsonError, requireAuth, squashMergeTree } from './rest.ts';
 import type { Ctx } from './rest.ts';
 
 // -------------------------------------------------------------------------------------------
@@ -624,6 +624,7 @@ const RESOLVERS: Record<string, Record<string, (parent: AnyObject, args: Record<
       found.issue.state = 'closed';
       found.issue.closedAt = trialNowIso();
       found.issue.updatedAt = trialNowIso();
+      invalidateIssue(found.repo, found.issue.number);
       return { __typename: 'CloseIssuePayload', __issue: issueObject(found.repo, found.issue) };
     },
     createPullRequest: (_parent, args, state) => {
@@ -727,6 +728,7 @@ const RESOLVERS: Record<string, Record<string, (parent: AnyObject, args: Record<
       list.push(comment);
       found.repo.comments.set(found.issue.number, list);
       found.issue.updatedAt = now;
+      invalidateIssue(found.repo, found.issue.number);
       return {
         __typename: 'AddCommentPayload',
         __commentEdge: {

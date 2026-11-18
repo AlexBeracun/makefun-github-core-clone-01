@@ -4,8 +4,7 @@
 // carries a non-empty X-GitHub-Request-Id.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
-import { handleRest, type Ctx } from './rest.ts';
+import { handleRest, type Ctx, type HeaderView } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { handleGitHttp } from './git-http.ts';
@@ -13,8 +12,10 @@ import { handleGitHttp } from './git-http.ts';
 let requestCounter = 0;
 
 function nextRequestId(): string {
+  // Counter-only: unique per process (the counter increments every request),
+  // no per-request crypto call on the hot path.
   requestCounter += 1;
-  return `req-${Date.now().toString(36)}-${requestCounter.toString(36)}-${randomBytes(4).toString('hex')}`;
+  return `req-${Date.now().toString(36)}-${requestCounter.toString(36)}`;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -34,11 +35,15 @@ export function createApp(): Server {
       const rawBody = await readBody(req);
       const host = req.headers.host ?? '127.0.0.1';
       const url = new URL(req.url ?? '/', `http://${host}`);
-      const headers = new Headers();
-      for (const [name, value] of Object.entries(req.headers)) {
-        if (Array.isArray(value)) headers.set(name, value.join(', '));
-        else if (value !== undefined) headers.set(name, value);
-      }
+      // Handlers only ever call headers.get(): a thin view over Node's
+      // already-lowercased req.headers is ~10x cheaper than building a Headers.
+      const headers: HeaderView = {
+        get(name: string): string | null {
+          const value = (req.headers as Record<string, string | string[] | undefined>)[name.toLowerCase()];
+          if (value === undefined) return null;
+          return Array.isArray(value) ? value.join(', ') : value;
+        },
+      };
 
       const contentType = (req.headers['content-type'] ?? '') as string;
       let body: unknown = null;
@@ -54,31 +59,46 @@ export function createApp(): Server {
       const respond = (status: number, payload: unknown, extraHeaders: Record<string, string> = {}): void => {
         if (responded) return;
         responded = true;
-        const headersOut: Record<string, string> = {
+        // Always send Content-Length: without it Node falls back to
+        // Transfer-Encoding: chunked, and the client pays a chunk decode per
+        // response (measured ~2x slower per request on the read workload).
+        if (status === 204 || payload === null || payload === undefined) {
+          res.writeHead(status, { 'X-GitHub-Request-Id': reqId, ...extraHeaders });
+          res.end();
+          return;
+        }
+        const bodyOut = Buffer.from(JSON.stringify(payload), 'utf8');
+        res.writeHead(status, {
           'content-type': 'application/json',
           'X-GitHub-Request-Id': reqId,
+          'content-length': String(bodyOut.length),
           ...extraHeaders,
-        };
-        res.writeHead(status, headersOut);
-        if (status === 204 || payload === null || payload === undefined) {
-          res.end();
-        } else {
-          res.end(JSON.stringify(payload));
-        }
+        });
+        res.end(bodyOut);
       };
       const respondRaw = (status: number, payload: Buffer, payloadContentType: string, extraHeaders: Record<string, string> = {}): void => {
         if (responded) return;
         responded = true;
-        res.writeHead(status, { 'content-type': payloadContentType, ...extraHeaders });
+        res.writeHead(status, {
+          'content-type': payloadContentType,
+          'content-length': String(payload.length),
+          ...extraHeaders,
+        });
         res.end(payload);
       };
 
+      // bodyText is read by no handler today; compute it lazily (once) instead
+      // of decoding every request body — push packs are kilobytes of binary.
+      let bodyTextCache: string | null = null;
       const ctx: Ctx = {
         method: req.method ?? 'GET',
         url,
         headers,
         body,
-        bodyText: rawBody.toString('utf8'),
+        get bodyText(): string {
+          if (bodyTextCache === null) bodyTextCache = rawBody.toString('utf8');
+          return bodyTextCache;
+        },
         rawBody,
         token,
         reqId,
@@ -101,8 +121,16 @@ export function createApp(): Server {
       }
     } catch (err) {
       if (!res.headersSent) {
-        res.writeHead(500, { 'content-type': 'application/json', 'X-GitHub-Request-Id': reqId });
-        res.end(JSON.stringify({ message: err instanceof Error ? err.message : 'Internal Server Error' }));
+        const bodyOut = Buffer.from(
+          JSON.stringify({ message: err instanceof Error ? err.message : 'Internal Server Error' }),
+          'utf8',
+        );
+        res.writeHead(500, {
+          'content-type': 'application/json',
+          'X-GitHub-Request-Id': reqId,
+          'content-length': String(bodyOut.length),
+        });
+        res.end(bodyOut);
       } else {
         res.end();
       }

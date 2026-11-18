@@ -406,10 +406,23 @@ export function collectAncestors(repo: Repo, oid: string): Set<string> {
   return seen;
 }
 
-/** True when `ancestor` is an ancestor of (or equal to) `oid`. */
+/** True when `ancestor` is an ancestor of (or equal to) `oid`. Early-exit walk: the old
+ * implementation collected the whole ancestor set first, which is O(history) per push
+ * and quadratic over a push chain (push N re-walks N commits). */
 export function isAncestor(repo: Repo, ancestor: string, oid: string): boolean {
   if (ancestor === oid) return true;
-  return collectAncestors(repo, oid).has(ancestor);
+  const seen = new Set<string>();
+  const stack = [oid];
+  while (stack.length) {
+    const current = stack.pop() as string;
+    if (current === ancestor) return true;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const object = repo.objects.get(current);
+    if (!object || object.type !== 'commit') continue;
+    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** Peel a tag (or commit) oid to its commit oid; null when the object is missing/not a commit. */

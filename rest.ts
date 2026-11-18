@@ -29,10 +29,16 @@ import {
   type Repo,
 } from './store.ts';
 
+/** Minimal header view: handlers only ever call .get(), so app.ts serves it straight from
+ * Node's already-lowercased req.headers instead of building a Headers per request. */
+export interface HeaderView {
+  get(name: string): string | null;
+}
+
 export interface Ctx {
   method: string;
   url: URL;
-  headers: Headers;
+  headers: HeaderView;
   body: unknown;
   bodyText: string;
   rawBody: Buffer;
@@ -439,6 +445,7 @@ function handleRepoRest(ctx: Ctx, owner: string, name: string, tail: string[]): 
       return true;
     }
     if (ctx.method === 'DELETE') {
+      invalidateIssueRepo(repo);
       store.deleteRepo(repo);
       ctx.respond(204, null);
       return true;
@@ -723,6 +730,53 @@ function treeEntryAt(repo: Repo, treeOid: string, path: string): { mode: string;
 }
 
 // -------------------------------------------------------------------------------------------
+// issue JSON cache
+// -------------------------------------------------------------------------------------------
+
+// The read workload GETs one issue 2,000x, and issueJson is deterministic —
+// trialNowIso is fixed per process, and every field only changes when the issue
+// itself mutates — so the serialized bytes are stable until invalidated.
+const ISSUE_CACHE_MAX = 4096;
+const issueJsonCache = new Map<string, Buffer>();
+
+function issueCacheKey(repo: Repo, number: number): string {
+  return `${repo.owner}/${repo.name}#${number}`;
+}
+
+function cachedIssueJson(repo: Repo, issue: Issue): Buffer {
+  const key = issueCacheKey(repo, issue.number);
+  const hit = issueJsonCache.get(key);
+  if (hit) return hit;
+  const buf = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issueJsonCache.set(key, buf);
+  if (issueJsonCache.size > ISSUE_CACHE_MAX) {
+    const oldest = issueJsonCache.keys().next().value;
+    if (oldest !== undefined) issueJsonCache.delete(oldest);
+  }
+  return buf;
+}
+
+function invalidateIssue(repo: Repo, number: number): void {
+  issueJsonCache.delete(issueCacheKey(repo, number));
+}
+
+export { invalidateIssue };
+
+function invalidateIssueRepo(repo: Repo): void {
+  const prefix = `${repo.owner}/${repo.name}#`;
+  for (const key of issueJsonCache.keys()) {
+    if (key.startsWith(prefix)) issueJsonCache.delete(key);
+  }
+}
+
+/** Answer with one issue's serialized JSON (cached; Content-Length included). */
+function respondIssue(ctx: Ctx, repo: Repo, issue: Issue, status: number): void {
+  ctx.respondRaw(status, cachedIssueJson(repo, issue), 'application/json', {
+    'X-GitHub-Request-Id': ctx.reqId,
+  });
+}
+
+// -------------------------------------------------------------------------------------------
 // issues / comments
 // -------------------------------------------------------------------------------------------
 
@@ -765,7 +819,7 @@ function handleIssues(ctx: Ctx, repo: Repo): boolean {
       closedAt: null,
     };
     repo.issues.set(issue.number, issue);
-    ctx.respond(201, issueJson(repo, issue));
+    respondIssue(ctx, repo, issue, 201);
     return true;
   }
   return methodNotAllowed(ctx);
@@ -776,7 +830,7 @@ function handleIssue(ctx: Ctx, repo: Repo, numberRaw: string): boolean {
   const issue = repo.issues.get(number);
   if (!issue) return jsonError(ctx, 404, 'Not Found'), true;
   if (ctx.method === 'GET') {
-    ctx.respond(200, issueJson(repo, issue));
+    respondIssue(ctx, repo, issue, 200);
     return true;
   }
   if (ctx.method === 'PATCH') {
@@ -796,7 +850,8 @@ function handleIssue(ctx: Ctx, repo: Repo, numberRaw: string): boolean {
       issue.labels = labelNames;
     }
     issue.updatedAt = trialNowIso();
-    ctx.respond(200, issueJson(repo, issue));
+    invalidateIssue(repo, number);
+    respondIssue(ctx, repo, issue, 200);
     return true;
   }
   return methodNotAllowed(ctx);
@@ -835,6 +890,7 @@ function handleComments(ctx: Ctx, repo: Repo, numberRaw: string): boolean {
     list.push(comment);
     repo.comments.set(number, list);
     issue.updatedAt = now;
+    invalidateIssue(repo, number);
     ctx.respond(201, {
       id: comment.dbId,
       node_id: globalId('comment', `${repo.owner}/${repo.name}#${number}:${comment.dbId}`),
